@@ -1,6 +1,6 @@
-# $Id: Memcached.pm,v 1.8 2003/12/01 19:07:23 bradfitz Exp $
+# $Id: Memcached.pm,v 1.27 2004/05/30 21:08:05 bradfitz Exp $
 #
-# Copyright (c) 2003  Brad Fitzpatrick <brad@danga.com>
+# Copyright (c) 2003, 2004  Brad Fitzpatrick <brad@danga.com>
 #
 # See COPYRIGHT section in pod text below for usage and distribution rights.
 #
@@ -10,12 +10,17 @@ package Cache::Memcached;
 use strict;
 no strict 'refs';
 use Storable ();
-use Socket qw(MSG_NOSIGNAL PF_INET SOCK_STREAM);
+use Socket qw( MSG_NOSIGNAL PF_INET SOCK_STREAM );
 use IO::Handle ();
+use Time::HiRes ();
+use Errno qw( EINPROGRESS EWOULDBLOCK EISCONN );
 
-BEGIN {
-    eval "use Time::HiRes qw (alarm);";
-}
+use fields qw{
+    debug no_rehash stats compress_threshold compress_enable stat_callback
+    readonly select_timeout namespace namespace_len servers active buckets
+    bucketcount _single_sock _stime
+};
+
 
 # flag definitions
 use constant F_STORABLE => 1;
@@ -25,7 +30,7 @@ use constant F_COMPRESS => 2;
 use constant COMPRESS_SAVINGS => 0.20; # percent
 
 use vars qw($VERSION $HAVE_ZLIB $FLAG_NOSIGNAL);
-$VERSION = "1.0.12";
+$VERSION = "1.13";
 
 BEGIN {
     $HAVE_ZLIB = eval "use Compress::Zlib (); 1;";
@@ -42,25 +47,31 @@ my $PROTO_TCP;
 our $SOCK_TIMEOUT = 2.6; # default timeout in seconds
 
 sub new {
-    my ($class, $args) = @_;
-    my $self = {};
-    bless $self, ref $class || $class;
+    my Cache::Memcached $self = shift;
+    $self = fields::new( $self ) unless ref $self;
+
+    my ($args) = @_;
 
     $self->set_servers($args->{'servers'});
-    $self->{'debug'} = $args->{'debug'};
+    $self->{'debug'} = $args->{'debug'} || 0;
     $self->{'no_rehash'} = $args->{'no_rehash'};
     $self->{'stats'} = {};
     $self->{'compress_threshold'} = $args->{'compress_threshold'};
     $self->{'compress_enable'}    = 1;
+    $self->{'stat_callback'} = $args->{'stat_callback'} || undef;
+    $self->{'readonly'} = $args->{'readonly'};
 
     # TODO: undocumented
     $self->{'select_timeout'} = $args->{'select_timeout'} || 1.0;
+    $self->{namespace} = $args->{namespace} || '';
+    $self->{namespace_len} = length $self->{namespace};
 
     return $self;
 }
 
 sub set_servers {
-    my ($self, $list) = @_;
+    my Cache::Memcached $self = shift;
+    my ($list) = @_;
     $self->{'servers'} = $list || [];
     $self->{'active'} = scalar @{$self->{'servers'}};
     $self->{'buckets'} = undef;
@@ -68,34 +79,50 @@ sub set_servers {
 
     $self->{'_single_sock'} = undef;
     if (@{$self->{'servers'}} == 1) {
-	$self->{'_single_sock'} = $self->{'servers'}[0];
+        $self->{'_single_sock'} = $self->{'servers'}[0];
     }
 
     return $self;
 }
 
 sub set_debug {
-    my ($self, $dbg) = @_;
+    my Cache::Memcached $self = shift;
+    my ($dbg) = @_;
     $self->{'debug'} = $dbg;
 }
 
+sub set_readonly {
+    my Cache::Memcached $self = shift;
+    my ($ro) = @_;
+    $self->{'readonly'} = $ro;
+}
+
 sub set_norehash {
-    my ($self, $val) = @_;
+    my Cache::Memcached $self = shift;
+    my ($val) = @_;
     $self->{'no_rehash'} = $val;
 }
 
 sub set_compress_threshold {
-    my ($self, $thresh) = @_;
+    my Cache::Memcached $self = shift;
+    my ($thresh) = @_;
     $self->{'compress_threshold'} = $thresh;
 }
 
 sub enable_compress {
-    my ($self, $enable) = @_;
+    my Cache::Memcached $self = shift;
+    my ($enable) = @_;
     $self->{'compress_enable'} = $enable;
 }
 
 sub forget_dead_hosts {
     %host_dead = ();
+}
+
+sub set_stat_callback {
+    my Cache::Memcached $self = shift;
+    my ($stat_callback) = @_;
+    $self->{'stat_callback'} = $stat_callback;
 }
 
 sub _dead_sock {
@@ -104,7 +131,7 @@ sub _dead_sock {
         my $now = time();
         my ($ip, $port) = ($1, $2);
         my $host = "$ip:$port";
-        $host_dead{$host} = $host_dead{$ip} = $now + $dead_for
+        $host_dead{$host} = $now + $dead_for
             if $dead_for;
         delete $cache_sock{$host};
     }
@@ -113,12 +140,10 @@ sub _dead_sock {
 
 sub _close_sock {
     my ($sock) = @_;
-    local $SIG{'ALRM'} = sub { _dead_sock($sock); die "alarm"; };
     if ($sock =~ /^Sock_(.+?):(\d+)$/) {
         my ($ip, $port) = ($1, $2);
         my $host = "$ip:$port";
-        alarm($SOCK_TIMEOUT);
-        eval { close $sock; alarm(0); };
+        close $sock;
         delete $cache_sock{$host};
     }
 }
@@ -127,11 +152,20 @@ sub _connect_sock { # sock, sin, timeout
     my ($sock, $sin, $timeout) = @_;
     $timeout ||= 0.25;
 
-    my $block = IO::Handle::blocking($sock, 0) if $timeout;
+    # make the socket non-blocking from now on,
+    # except if someone wants 0 timeout, meaning
+    # a blocking connect, but even then turn it
+    # non-blocking at the end of this function
+
+    if ($timeout) {
+        IO::Handle::blocking($sock, 0);
+    } else {
+        IO::Handle::blocking($sock, 1);
+    }
 
     my $ret = connect($sock, $sin);
 
-    if (!$ret && $timeout && $!{'EINPROGRESS'}) {
+    if (!$ret && $timeout && $!==EINPROGRESS) {
 
         my $win='';
         vec($win, fileno($sock), 1) = 1;
@@ -139,11 +173,17 @@ sub _connect_sock { # sock, sin, timeout
         if (select(undef, $win, undef, $timeout) > 0) {
             $ret = connect($sock, $sin);
             # EISCONN means connected & won't re-connect, so success
-            $ret = 1 if !$ret && $!{'EISCONN'};
+            $ret = 1 if !$ret && $!==EISCONN;
         }
     }
 
-    IO::Handle::blocking($sock, $block) if $timeout;
+    unless ($timeout) { # socket was temporarily blocking, now revert
+        IO::Handle::blocking($sock, 0);
+    }
+
+    # from here on, we use non-blocking (async) IO for the duration
+    # of the socket's life
+
     return $ret;
 }
 
@@ -154,9 +194,7 @@ sub sock_to_host { # (host)
     my $now = time();
     my ($ip, $port) = $host =~ /(.*):(\d+)/;
     return undef if
-         $host_dead{$host} && $host_dead{$host} > $now ||
-         $host_dead{$ip} && $host_dead{$ip} > $now;
-
+        $host_dead{$host} && $host_dead{$host} > $now;
     my $sock = "Sock_$host";
     my $proto = $PROTO_TCP ||= getprotobyname('tcp');
 
@@ -167,15 +205,16 @@ sub sock_to_host { # (host)
         unless _connect_sock($sock,$sin);
 
     # make the new socket not buffer writes.
-    select($sock);
+    my $old = select($sock);
     $| = 1;
-    select(STDOUT);
+    select($old);
 
     return $cache_sock{$host} = $sock;
 }
 
 sub get_sock { # (key)
-    my ($self, $key) = @_;
+    my Cache::Memcached $self = shift;
+    my ($key) = @_;
     return sock_to_host($self->{'_single_sock'}) if $self->{'_single_sock'};
     return undef unless $self->{'active'};
     my $hv = ref $key ? int($key->[0]) : _hashfunc($key);
@@ -195,7 +234,7 @@ sub get_sock { # (key)
 }
 
 sub init_buckets {
-    my ($self) = @_;
+    my Cache::Memcached $self = shift;
     return if $self->{'buckets'};
     my $bu = $self->{'buckets'} = [];
     foreach my $v (@{$self->{'servers'}}) {
@@ -210,37 +249,98 @@ sub init_buckets {
 
 sub disconnect_all {
     my $sock;
-    local $SIG{'ALRM'} = sub { _dead_sock($sock); die "alarm"; };
-    alarm($SOCK_TIMEOUT);
     foreach $sock (values %cache_sock) {
-        eval { close $sock; };
-        alarm($SOCK_TIMEOUT) if $@ eq 'alarm'; #re-alarm
+        close $sock;
     }
-    alarm(0);
     %cache_sock = ();
 }
 
+sub _oneline {
+    my Cache::Memcached $self = shift;
+    my ($sock, $line) = @_;
+    my $res;
+    my ($ret, $offset) = (undef, 0);
+
+    # state: 0 - writing, 1 - reading, 2 - done
+    my $state = defined $line ? 0 : 1;
+
+    # the bitsets for select
+    my ($rin, $rout, $win, $wout);
+    my $nfound;
+
+    my $copy_state = -1;
+    local $SIG{'PIPE'} = "IGNORE" unless $FLAG_NOSIGNAL;
+
+    # the select loop
+    while(1) {
+        if ($copy_state!=$state) {
+            last if $state==2;
+            ($rin, $win) = ('', '');
+            vec($rin, fileno($sock), 1) = 1 if $state==1;
+            vec($win, fileno($sock), 1) = 1 if $state==0;
+            $copy_state = $state;
+        }
+        $nfound = select($rout=$rin, $wout=$win, undef,
+                         $self->{'select_timeout'});
+        last unless $nfound;
+
+        if (vec($wout, fileno($sock), 1)) {
+            $res = send($sock, $line, $FLAG_NOSIGNAL);
+            next
+                if not defined $res and $!==EWOULDBLOCK;
+            unless ($res > 0) {
+                _close_sock($sock);
+                return undef;
+            }
+            if ($res == length($line)) { # all sent
+                $state = 1;
+            } else { # we only succeeded in sending some of it
+                substr($line, 0, $res, ''); # delete the part we sent
+            }
+        }
+
+        if (vec($rout, fileno($sock), 1)) {
+            $res = sysread($sock, $ret, 255, $offset);
+            next
+                if !defined($res) and $!==EWOULDBLOCK;
+            if ($res == 0) { # catches 0=conn closed or undef=error
+                _close_sock($sock);
+                return undef;
+            }
+            $offset += $res;
+            if (rindex($ret, "\r\n") + 2 == length($ret)) {
+                $state = 2;
+            }
+        }
+    }
+
+    unless ($state == 2) {
+        _dead_sock($sock); # improperly finished
+        return undef;
+    }
+
+    return $ret;
+}
+
+
 sub delete {
-    my ($self, $key, $time) = @_;
-    return 0 unless $self->{'active'};
+    my Cache::Memcached $self = shift;
+    my ($key, $time) = @_;
+    return 0 if ! $self->{'active'} || $self->{'readonly'};
+    my $stime = Time::HiRes::time() if $self->{'stat_callback'};
     my $sock = $self->get_sock($key);
     return 0 unless $sock;
 
     $self->{'stats'}->{"delete"}++;
     $key = ref $key ? $key->[1] : $key;
     $time = $time ? " $time" : "";
-    my $cmd = "delete $key$time\r\n";
-    my $res = "";
+    my $cmd = "delete $self->{namespace}$key$time\r\n";
+    my $res = _oneline($self, $sock, $cmd);
 
-    local $SIG{'PIPE'} = "IGNORE" unless $FLAG_NOSIGNAL;
-    local $SIG{'ALRM'} = sub { _dead_sock($sock); die "alarm"; };
-    alarm($SOCK_TIMEOUT);
-    eval {
-        send($sock, $cmd, $FLAG_NOSIGNAL) ?
-            ($res = readline($sock)) :
-            _dead_sock($sock);
-        alarm(0);
-    };
+    if ($self->{'stat_callback'}) {
+        my $etime = Time::HiRes::time();
+        $self->{'stat_callback'}->($stime, $etime, $sock, 'delete');
+    }
 
     return $res eq "DELETED\r\n";
 }
@@ -258,8 +358,11 @@ sub set {
 }
 
 sub _set {
-    my ($cmdname, $self, $key, $val, $exptime) = @_;
-    return 0 unless $self->{'active'};
+    my $cmdname = shift;
+    my Cache::Memcached $self = shift;
+    my ($key, $val, $exptime) = @_;
+    return 0 if ! $self->{'active'} || $self->{'readonly'};
+    my $stime = Time::HiRes::time() if $self->{'stat_callback'};
     my $sock = $self->get_sock($key);
     return 0 unless $sock;
 
@@ -293,26 +396,21 @@ sub _set {
     $exptime = int($exptime || 0);
 
     local $SIG{'PIPE'} = "IGNORE" unless $FLAG_NOSIGNAL;
-    local $SIG{'ALRM'} = sub { _dead_sock($sock); die "alarm"; };
-    alarm($SOCK_TIMEOUT);
-    my ($res, $line) = (0, "");
-    eval {
-        $res = send($sock, "$cmdname $key $flags $exptime $len\r\n$val\r\n", $FLAG_NOSIGNAL);
-        if ($res) {
-            $line = readline($sock);
-            $res = $line eq "STORED\r\n";
-        }
-        else {
-            _dead_sock($sock);
-        }
-        alarm(0);
-    };
+    my $line = "$cmdname $self->{namespace}$key $flags $exptime $len\r\n$val\r\n";
+
+    my $res = _oneline($self, $sock, $line);
 
     if ($self->{'debug'} && $line) {
         chop $line; chop $line;
-        print STDERR "Cache::Memcache: $cmdname $key = $val ($line)\n";
+        print STDERR "Cache::Memcache: $cmdname $self->{namespace}$key = $val ($line)\n";
     }
-    return $res;
+
+    if ($self->{'stat_callback'}) {
+        my $etime = Time::HiRes::time();
+        $self->{'stat_callback'}->($stime, $etime, $sock, $cmdname);
+    }
+
+    return $res eq "STORED\r\n";
 }
 
 sub incr {
@@ -324,40 +422,43 @@ sub decr {
 }
 
 sub _incrdecr {
-    my ($cmdname, $self, $key, $value) = @_;
-    return undef unless $self->{'active'};
+    my $cmdname = shift;
+    my Cache::Memcached $self = shift;
+    my ($key, $value) = @_;
+    return undef if ! $self->{'active'} || $self->{'readonly'};
+    my $stime = Time::HiRes::time() if $self->{'stat_callback'};
     my $sock = $self->get_sock($key);
     return undef unless $sock;
     $key = $key->[1] if ref $key;
     $self->{'stats'}->{$cmdname}++;
     $value = 1 unless defined $value;
 
-    local $SIG{'PIPE'} = "IGNORE" unless $FLAG_NOSIGNAL;
-    local $SIG{'ALRM'} = sub { _dead_sock($sock); die "alarm"; };
-    alarm($SOCK_TIMEOUT);
-    my $line;
-    eval {
-        send($sock, "$cmdname $key $value\r\n", $FLAG_NOSIGNAL) ?
-            $line = readline($sock) :
-            _dead_sock($sock);
-        alarm(0);
-    };
+    my $line = "$cmdname $self->{namespace}$key $value\r\n";
+    my $res = _oneline($self, $sock, $line);
 
-    return undef unless $line =~ /^(\d+)/;
+    if ($self->{'stat_callback'}) {
+        my $etime = Time::HiRes::time();
+        $self->{'stat_callback'}->($stime, $etime, $sock, $cmdname);
+    }
+
+    return undef unless $res =~ /^(\d+)/;
     return $1;
 }
 
 sub get {
-    my ($self, $key) = @_;
+    my Cache::Memcached $self = shift;
+    my ($key) = @_;
 
     # TODO: make a fast path for this?  or just keep using get_multi?
     my $r = $self->get_multi($key);
-    return $r->{$key};
+    my $kval = ref $key ? $key->[1] : $key;
+    return $r->{$kval};
 }
 
 sub get_multi {
-    my $self = shift;
+    my Cache::Memcached $self = shift;
     return undef unless $self->{'active'};
+    $self->{'_stime'} = Time::HiRes::time() if $self->{'stat_callback'};
     $self->{'stats'}->{"get_multi"}++;
     my %val;        # what we'll be returning a reference to (realkey -> value)
     my %sock_keys;  # sockref_as_scalar -> [ realkeys ]
@@ -366,8 +467,8 @@ sub get_multi {
     foreach my $key (@_) {
         $sock = $self->get_sock($key);
         next unless $sock;
-        $key = ref $key ? $key->[1] : $key;
-        push @{$sock_keys{$sock}}, $key;
+        my $kval = ref $key ? $key->[1] : $key;
+        push @{$sock_keys{$sock}}, $kval;
     }
     $self->{'stats'}->{"get_keys"} += @_;
     $self->{'stats'}->{"get_socks"} += keys %sock_keys;
@@ -386,10 +487,10 @@ sub get_multi {
 
 sub _load_multi {
     use bytes; # return bytes from length()
-    my ($self, $sock_keys, $ret) = @_;
+    my Cache::Memcached $self = shift;
+    my ($sock_keys, $ret) = @_;
 
     # all keyed by a $sock:
-    my %blocks;  # old blocking value
     my %reading; # bool, whether we're reading from this socket
     my %writing; # bool, whether we're writing into this socket
     my %state;   # reading state:
@@ -401,9 +502,8 @@ sub _load_multi {
 
     foreach (keys %$sock_keys) {
         print STDERR "processing socket $_\n" if $self->{'debug'} >= 2;
-        $blocks{$_} = IO::Handle::blocking($_,0);
         $writing{$_} = 1;
-        $buf{$_} = "get @{$sock_keys->{$_}}\r\n";
+        $buf{$_} = "get ". join(" ", map { "$self->{namespace}$_" } @{$sock_keys->{$_}}) . "\r\n";
     }
 
     my $active_changed = 1; # force rebuilding of select sets
@@ -413,9 +513,14 @@ sub _load_multi {
         print STDERR "killing socket $sock\n" if $self->{'debug'} >= 2;
         delete $reading{$sock};
         delete $writing{$sock};
-        delete $blocks{$sock};
         delete $ret->{$key{$sock}}
             if $key{$sock};
+
+        if ($self->{'stat_callback'}) {
+            my $etime = Time::HiRes::time();
+            $self->{'stat_callback'}->($self->{'_stime'}, $etime, $sock, 'get_multi');
+        }
+
         close $sock;
         _dead_sock($sock);
         $active_changed = 1;
@@ -435,8 +540,19 @@ sub _load_multi {
 
         $ret->{$k} = Compress::Zlib::memGunzip($ret->{$k})
             if $HAVE_ZLIB && $flags{$sock} & F_COMPRESS;
-        $ret->{$k} = Storable::thaw($ret->{$k})
-            if $flags{$sock} & F_STORABLE;
+        if ($flags{$sock} & F_STORABLE) {
+            # wrapped in eval in case a perl 5.6 Storable tries to
+            # unthaw data from a perl 5.8 Storable.  (5.6 is stupid
+            # and dies if the version number changes at all.  in 5.8
+            # they made it only die if it unencounters a new feature)
+            eval {
+                $ret->{$k} = Storable::thaw($ret->{$k});
+            };
+            # so if there was a problem, just treat it as a cache miss.
+            if ($@) {
+                delete $ret->{$k};
+            }
+        }
     };
 
     my $read = sub {
@@ -449,7 +565,7 @@ sub _load_multi {
                            $state{$sock} - $offset{$sock},
                            $offset{$sock});
             return
-                if !defined($res) and $!{EWOULDBLOCK};
+                if !defined($res) and $!==EWOULDBLOCK;
             if ($res == 0) { # catches 0=conn closed or undef=error
                 $dead->($sock);
                 return;
@@ -468,7 +584,7 @@ sub _load_multi {
         $res = sysread($sock, $buf{$sock},
                        2048, $offset{$sock});
         return
-            if !defined($res) and $!{EWOULDBLOCK};
+            if !defined($res) and $!==EWOULDBLOCK;
         if ($res == 0) {
             $dead->($sock);
             return;
@@ -487,7 +603,8 @@ sub _load_multi {
 
             # do we have a complete VALUE line?
             if ($buf{$sock} =~ /^VALUE (\S+) (\d+) (\d+)\r\n/g) {
-                ($key{$sock}, $flags{$sock}, $state{$sock}) = ($1, int($2), $3+2);
+                ($key{$sock}, $flags{$sock}, $state{$sock}) =
+                    (substr($1, $self->{namespace_len}), int($2), $3+2);
                 my $p = pos($buf{$sock});
                 pos($buf{$sock}) = 0;
                 my $len = length($buf{$sock});
@@ -526,7 +643,7 @@ sub _load_multi {
 
         $res = send($sock, $buf{$sock}, $FLAG_NOSIGNAL);
         return
-            if not defined $res and $!{EWOULDBLOCK};
+            if not defined $res and $!==EWOULDBLOCK;
         unless ($res > 0) {
             $dead->($sock);
             return;
@@ -552,7 +669,7 @@ sub _load_multi {
     while(1) {
         if ($active_changed) {
             last unless %reading or %writing; # no sockets left?
-            ($rin, $win) = (undef, undef);
+            ($rin, $win) = ('', '');
             foreach (keys %reading) {
                 vec($rin, fileno($_), 1) = 1;
             }
@@ -590,10 +707,6 @@ sub _load_multi {
         $dead->($_);
     }
 
-    # unblock sockets that made it
-    foreach (keys %blocks) {
-        IO::Handle::blocking($_, $blocks{$_});
-    }
     return;
 }
 
@@ -607,36 +720,31 @@ sub _hashfunc {
 
 # returns array of lines, or () on failure.
 sub run_command {
+    my Cache::Memcached $self = shift;
     my ($sock, $cmd) = @_;
     return () unless $sock;
-    my @ret;
-    local $SIG{'PIPE'} = "IGNORE" unless $FLAG_NOSIGNAL;
-    local $SIG{'ALRM'} = sub { _dead_sock($sock); die "alarm"; };
-    alarm($SOCK_TIMEOUT);
-    eval {
-        if (send($sock, $cmd, $FLAG_NOSIGNAL)) {
-            while (my $res = readline($sock)) {
-                push @ret, $res;
-                last if $res eq "END\r\n";
-            }
-        }
-	alarm(0);
-    };
-    @ret = () if $@ eq 'alarm';
-
-    return @ret;
+    my $ret;
+    my $line = $cmd;
+    while (my $res = _oneline($self, $sock, $line)) {
+        undef $line;
+    $ret .= $res;
+        last if $ret =~ /(?:END|ERROR)\r\n$/;
+    }
+    chop $ret; chop $ret;
+    return map { "$_\r\n" } split(/\r\n/, $ret);
 }
 
 sub stats {
-    my ($self, $types) = @_;
+    my Cache::Memcached $self = shift;
+    my ($types) = @_;
     return 0 unless $self->{'active'};
     return 0 unless !ref($types) || ref($types) eq 'ARRAY';
     if (!ref($types)) {
         if (!$types) {
             # I don't much care what the default is, it should just
-	    # be something reasonable.  Obviously "reset" should not
-	    # be on the list :) but other types that might go in here
-	    # include maps, cachedump, slabs, or items.
+            # be something reasonable.  Obviously "reset" should not
+            # be on the list :) but other types that might go in here
+            # include maps, cachedump, slabs, or items.
             $types = [ qw( misc malloc sizes self ) ];
         } else {
             $types = [ $types ];
@@ -656,56 +764,55 @@ sub stats {
     # Now handle the other types, passing each type to each host server.
     my @hosts = @{$self->{'buckets'}};
     my %malloc_keys = ( );
-    HOST: foreach my $host (@hosts) {
+  HOST: foreach my $host (@hosts) {
         my $sock = sock_to_host($host);
-        TYPE: foreach my $typename (grep !/^self$/, @$types) {
+      TYPE: foreach my $typename (grep !/^self$/, @$types) {
             my $type = $typename eq 'misc' ? "" : " $typename";
-	    my $ok = 0;
-	    local $SIG{'ALRM'} = sub { _dead_sock($sock); die "alarm"; };
-	    alarm($SOCK_TIMEOUT);
-	    eval {
-		$ok = send($sock, "stats$type\r\n", MSG_NOSIGNAL);
-		alarm(0);
-	    };
-	    if (!$ok) {
-	        _dead_sock($sock);
-		next HOST;
-	    }
+            my $line = _oneline($self, $sock, "stats$type\r\n");
+            if (!$line) {
+                _dead_sock($sock);
+                next HOST;
+            }
 
-	    # Some stats are key-value, some are not.  malloc,
-	    # sizes, and the empty string are key-value.
-	    # ("self" was handled separately above.)
+            # Some stats are key-value, some are not.  malloc,
+            # sizes, and the empty string are key-value.
+            # ("self" was handled separately above.)
             if ($typename =~ /^(malloc|sizes|misc)$/) {
-	        # This stat is key-value.
-                LINE: while (my $line = readline($sock)) {
-	            # We have to munge this data a little.  First, I'm not
-		    # sure why, but 'stats sizes' output begins with NUL.
+                # This stat is key-value.
+              LINE: while ($line) {
+                    # We have to munge this data a little.  First, I'm not
+                    # sure why, but 'stats sizes' output begins with NUL.
                     $line =~ s/^\0//;
-		    # And, most lines end in \r\n but 'stats maps' (as of
-		    # July 2003 at least) ends in \n.  An alternative
-		    # would be { local $/="\r\n"; chomp } but this works
-		    # just as well:
+
+                    # And, most lines end in \r\n but 'stats maps' (as of
+                    # July 2003 at least) ends in \n.  An alternative
+                    # would be { local $/="\r\n"; chomp } but this works
+                    # just as well:
                     $line =~ s/[\r\n]+$//;
-		    # OK, process the data until the end, converting it
-		    # into its key-value pairs.
+
+                    # OK, process the data until the end, converting it
+                    # into its key-value pairs.
                     last LINE if $line eq 'END';
                     my($key, $value) = $line =~ /^(?:STAT )?(\w+)\s(.*)/;
-                    next LINE unless $key;
-                    if ($typename) {
+                    if ($key) {
                         $stats_hr->{'hosts'}{$host}{$typename}{$key} = $value;
-                    } else {
-                        $stats_hr->{'hosts'}{$host}{$key} = $value;
                     }
-		    $malloc_keys{$key} = 1 if $typename eq 'malloc';
+                    $malloc_keys{$key} = 1 if $typename eq 'malloc';
+
+                    # read the next line
+                    $line = _oneline($self, $sock);
                 }
             } else {
-	        # This stat is not key-value so just pull it
-		# all out in one blob.
-                LINE: while (my $line .= readline($sock)) {
+                # This stat is not key-value so just pull it
+                # all out in one blob.
+              LINE: while ($line) {
                     $line =~ s/[\r\n]+$//;
                     last LINE if $line eq 'END';
                     $stats_hr->{'hosts'}{$host}{$typename} ||= "";
                     $stats_hr->{'hosts'}{$host}{$typename} .= "$line\n";
+
+                    # read the next one
+                    $line = _oneline($self, $sock);
                 }
             }
         }
@@ -714,46 +821,41 @@ sub stats {
     # Now get the sum total of applicable values.  First the misc values.
     foreach my $stat (qw(
         bytes bytes_read bytes_written
-	cmd_get cmd_set connection_structures curr_items
-	get_hits get_misses
-	total_connections total_items
-    )) {
-	$stats_hr->{'total'}{$stat} = 0;
+        cmd_get cmd_set connection_structures curr_items
+        get_hits get_misses
+        total_connections total_items
+        )) {
+        $stats_hr->{'total'}{$stat} = 0;
         foreach my $host (@hosts) {
-	    $stats_hr->{'total'}{$stat} +=
-	    	$stats_hr->{'hosts'}{$host}{'misc'}{$stat};
-	}
+            $stats_hr->{'total'}{$stat} +=
+                $stats_hr->{'hosts'}{$host}{'misc'}{$stat};
+        }
     }
+
     # Then all the malloc values, if any.
     foreach my $malloc_stat (keys %malloc_keys) {
         $stats_hr->{'total'}{"malloc_$malloc_stat"} = 0;
         foreach my $host (@hosts) {
-	    $stats_hr->{'total'}{"malloc_$malloc_stat"} +=
-	        $stats_hr->{'hosts'}{$host}{'malloc'}{$malloc_stat};
-	}
+            $stats_hr->{'total'}{"malloc_$malloc_stat"} +=
+                $stats_hr->{'hosts'}{$host}{'malloc'}{$malloc_stat};
+        }
     }
 
     return $stats_hr;
 }
 
 sub stats_reset {
-    my ($self, $types) = @_;
+    my Cache::Memcached $self = shift;
+    my ($types) = @_;
     return 0 unless $self->{'active'};
 
     $self->init_buckets() unless $self->{'buckets'};
 
-    HOST: foreach my $host (@{$self->{'buckets'}}) {
+  HOST: foreach my $host (@{$self->{'buckets'}}) {
         my $sock = sock_to_host($host);
-	my $ok = 0;
-        local $SIG{'ALRM'} = sub { _dead_sock($sock); die "alarm"; };
-        alarm($SOCK_TIMEOUT);
-        eval {
-	    $ok = send($sock, "stats reset", MSG_NOSIGNAL);
-	    alarm(0);
-        };
-        if (!$ok) {
-	    _dead_sock($sock);
-	    next HOST;
+        my $ok = _oneline($self, $sock, "stats reset");
+        unless ($ok eq "RESET\r\n") {
+            _dead_sock($sock);
         }
     }
     return 1;
@@ -823,6 +925,10 @@ Use C<no_rehash> to disable finding a new memcached server when one
 goes down.  Your application may or may not need this, depending on
 your expirations and key usage.
 
+Use C<readonly> to disable writes to backend memcached servers.  Only
+get and get_multi will work.  This is useful in bizarre debug and
+profiling cases only.
+
 The other useful key is C<debug>, which when set to true will produce
 diagnostics on STDERR.
 
@@ -841,6 +947,10 @@ constructor.
 =item C<set_debug>
 
 Sets the C<debug> flag.  See C<new> constructor for more information.
+
+=item C<set_readonly>
+
+Sets the C<readonly> flag.  See C<new> constructor for more information.
 
 =item C<set_norehash>
 
@@ -907,6 +1017,15 @@ $memd->replace($key, $value[, $exptime]);
 
 Like C<set>, but only stores in memcache if the key already exists.  The
 opposite of C<add>.
+
+=item C<delete>
+
+$memd->delete($key[, $time]);
+
+Deletes a key.  You may optionally provide an integer time value (in seconds) to
+tell the memcached server to block new writes to this key for that many seconds.
+(Sometimes useful as a hacky means to prevent races.)  Returns true if key
+was found and deleted, and false otherwise.
 
 =item C<incr>
 
