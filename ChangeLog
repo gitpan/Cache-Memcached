@@ -1,0 +1,70 @@
+2003-10-25
+	* version 1.0.10, rename to Cache::Memcached, upload to CPAN
+	
+2003-10-18
+	* implement read/write timeouts everywhere. Now the client shouldn't
+          hang if the server machine goes down unexpectedly. (avva)
+
+2003-10-16
+	* use Storable::nfreeze instead of freeze, so hosts from different
+	  architectures can all use the same data.  (all must use Perl, though.
+	  the different memcache APIs all store/pickle/serialize data differently)
+	  Suggestion by Jason Titus <jtitus@postini.com>
+	
+2003-10-06
+	* fix _incrdecr to return complete number, not just first
+	  digit (thanks to Ryan T. Dean)
+	* release version 1.0.9
+
+2003-10-04
+	* document expiration times in POD (thanks to Tim Bunce
+	  for noting the omission)
+	* release version 1.0.8
+	
+2003-10-03
+	* add connect timeout of 0.25s, for dead host detection.
+	  We had 1 second a couple revs ago, but lost it when
+	  ditching IO::Socket module.  (avva)
+	
+2003-10-02
+	* fix _incrdecr with explicit-hashvalue keys (whitaker)
+	
+2003-10-01
+	* add run_command API call.  TODO: document, and document
+	  the $exptime on the setters
+		  
+2003-09-30
+	* use send instead of print, so we can set MSG_NOSIGNAL
+	  and not get SIGPIPES, which avoids 3 syscalls of localizing
+	  $SIG{PIPE} and sends everything at once, instead of 4k
+	  stdio chunks.  in review:  stdio buffered in, send unbuffered
+	  out.  TODO:  setvbuf so reads are buffered at more than 4k.
+
+2003-09-29
+	* yet faster parsing
+	* switch to stdio/perlio instead of raw io: more correct,
+	  simpler parsing code.
+
+2003-09-28
+	* prevent some warnings
+	* faster get() call that doesn't use get_multi()
+	* optimizations for single-server case
+	* use socket APIs directly, instead of uber-slow IO::* modules
+	* new faster _load_items parsing
+	
+2003-09-04	
+	* emit debug when set/add/replace fails, in addition to succeed
+      
+Version 1.0.7
+	-- compression support (Brad Whitaker)
+	
+Version 1.0.6
+	-- incr/decr client support
+	-- make delete optionally take second argument (server now supports
+	   a delay time on delete)
+	-- doc updates from Jamie McCarthy
+	-- better hashing after dead host detection:  new requests go to different
+	   remaining hosts, instead of all to the same one.
+
+Version 1.0.2
+	-- initial release, about.
