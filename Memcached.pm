@@ -1,4 +1,4 @@
-# $Id: Memcached.pm,v 1.27 2004/05/30 21:08:05 bradfitz Exp $
+# $Id: Memcached.pm,v 1.32 2004/07/27 17:07:04 bradfitz Exp $
 #
 # Copyright (c) 2003, 2004  Brad Fitzpatrick <brad@danga.com>
 #
@@ -10,17 +10,18 @@ package Cache::Memcached;
 use strict;
 no strict 'refs';
 use Storable ();
-use Socket qw( MSG_NOSIGNAL PF_INET SOCK_STREAM );
+use Socket qw( MSG_NOSIGNAL PF_INET IPPROTO_TCP SOCK_STREAM );
 use IO::Handle ();
 use Time::HiRes ();
+use String::CRC32;
 use Errno qw( EINPROGRESS EWOULDBLOCK EISCONN );
 
 use fields qw{
     debug no_rehash stats compress_threshold compress_enable stat_callback
     readonly select_timeout namespace namespace_len servers active buckets
+    pref_ip
     bucketcount _single_sock _stime
 };
-
 
 # flag definitions
 use constant F_STORABLE => 1;
@@ -30,7 +31,7 @@ use constant F_COMPRESS => 2;
 use constant COMPRESS_SAVINGS => 0.20; # percent
 
 use vars qw($VERSION $HAVE_ZLIB $FLAG_NOSIGNAL);
-$VERSION = "1.13";
+$VERSION = "1.14";
 
 BEGIN {
     $HAVE_ZLIB = eval "use Compress::Zlib (); 1;";
@@ -56,6 +57,7 @@ sub new {
     $self->{'debug'} = $args->{'debug'} || 0;
     $self->{'no_rehash'} = $args->{'no_rehash'};
     $self->{'stats'} = {};
+    $self->{'pref_ip'} = $args->{'pref_ip'} || {};
     $self->{'compress_threshold'} = $args->{'compress_threshold'};
     $self->{'compress_enable'}    = 1;
     $self->{'stat_callback'} = $args->{'stat_callback'} || undef;
@@ -67,6 +69,11 @@ sub new {
     $self->{namespace_len} = length $self->{namespace};
 
     return $self;
+}
+
+sub set_pref_ip {
+    my Cache::Memcached $self = shift;
+    $self->{'pref_ip'} = shift;
 }
 
 sub set_servers {
@@ -188,6 +195,7 @@ sub _connect_sock { # sock, sin, timeout
 }
 
 sub sock_to_host { # (host)
+    my Cache::Memcached $self = ref $_[0] ? shift : undef;
     my $host = $_[0];
     return $cache_sock{$host} if $cache_sock{$host};
 
@@ -196,13 +204,31 @@ sub sock_to_host { # (host)
     return undef if
         $host_dead{$host} && $host_dead{$host} > $now;
     my $sock = "Sock_$host";
+
+    my $connected = 0;
+    my $sin;
     my $proto = $PROTO_TCP ||= getprotobyname('tcp');
 
-    socket($sock, PF_INET, SOCK_STREAM, $proto);
-    my $sin = Socket::sockaddr_in($port,Socket::inet_aton($ip));
+    # if a preferred IP is known, try that first.
+    if ($self && $self->{pref_ip}{$ip}) {
+        socket($sock, PF_INET, SOCK_STREAM, $proto);
+        my $prefip = $self->{pref_ip}{$ip};
+        $sin = Socket::sockaddr_in($port,Socket::inet_aton($prefip));
+        if (_connect_sock($sock,$sin,0.1)) {
+            $connected = 1;
+        } else {
+            close $sock;
+        }
+    }
 
-    return _dead_sock($sock, undef, 20 + int(rand(10)))
-        unless _connect_sock($sock,$sin);
+    # normal path, or fallback path if preferred IP failed
+    unless ($connected) {
+        socket($sock, PF_INET, SOCK_STREAM, $proto);
+        $sin = Socket::sockaddr_in($port,Socket::inet_aton($ip));
+        unless (_connect_sock($sock,$sin)) {
+            return _dead_sock($sock, undef, 20 + int(rand(10)));
+        }
+    }
 
     # make the new socket not buffer writes.
     my $old = select($sock);
@@ -215,7 +241,7 @@ sub sock_to_host { # (host)
 sub get_sock { # (key)
     my Cache::Memcached $self = shift;
     my ($key) = @_;
-    return sock_to_host($self->{'_single_sock'}) if $self->{'_single_sock'};
+    return $self->sock_to_host($self->{'_single_sock'}) if $self->{'_single_sock'};
     return undef unless $self->{'active'};
     my $hv = ref $key ? int($key->[0]) : _hashfunc($key);
 
@@ -225,7 +251,7 @@ sub get_sock { # (key)
     my $tries = 0;
     while ($tries++ < 20) {
         my $host = $self->{'buckets'}->[$hv % $self->{'bucketcount'}];
-        my $sock = sock_to_host($host);
+        my $sock = $self->sock_to_host($host);
         return $sock if $sock;
         return undef if $sock->{'no_rehash'};
         $hv += _hashfunc($tries . $real_key);  # stupid, but works
@@ -602,11 +628,14 @@ sub _load_multi {
             }
 
             # do we have a complete VALUE line?
-            if ($buf{$sock} =~ /^VALUE (\S+) (\d+) (\d+)\r\n/g) {
+            if ($buf{$sock} =~ /^VALUE (\S+) (\d+) (\d+)\r\n/) {
                 ($key{$sock}, $flags{$sock}, $state{$sock}) =
                     (substr($1, $self->{namespace_len}), int($2), $3+2);
-                my $p = pos($buf{$sock});
-                pos($buf{$sock}) = 0;
+                # Note: we use $+[0] and not pos($buf{$sock}) because pos()
+                # seems to have problems under perl's taint mode.  nobody
+                # on the list discovered why, but this seems a reasonable
+                # work-around:
+                my $p = $+[0];
                 my $len = length($buf{$sock});
                 my $copy = $len-$p > $state{$sock} ? $state{$sock} : $len-$p;
                 $ret->{$key{$sock}} = substr($buf{$sock}, $p, $copy)
@@ -711,11 +740,7 @@ sub _load_multi {
 }
 
 sub _hashfunc {
-    my $hash = 0;
-    foreach (split //, shift) {
-        $hash = $hash*33 + ord($_);
-    }
-    return $hash;
+    return (crc32(shift) >> 16) & 0x7fff;
 }
 
 # returns array of lines, or () on failure.
@@ -765,7 +790,7 @@ sub stats {
     my @hosts = @{$self->{'buckets'}};
     my %malloc_keys = ( );
   HOST: foreach my $host (@hosts) {
-        my $sock = sock_to_host($host);
+        my $sock = $self->sock_to_host($host);
       TYPE: foreach my $typename (grep !/^self$/, @$types) {
             my $type = $typename eq 'misc' ? "" : " $typename";
             my $line = _oneline($self, $sock, "stats$type\r\n");
@@ -852,7 +877,7 @@ sub stats_reset {
     $self->init_buckets() unless $self->{'buckets'};
 
   HOST: foreach my $host (@{$self->{'buckets'}}) {
-        my $sock = sock_to_host($host);
+        my $sock = $self->sock_to_host($host);
         my $ok = _oneline($self, $sock, "stats reset");
         unless ($ok eq "RESET\r\n") {
             _dead_sock($sock);
