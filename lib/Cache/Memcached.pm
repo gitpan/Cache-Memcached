@@ -1,4 +1,4 @@
-# $Id: Memcached.pm,v 1.34 2005/09/21 05:28:00 bradfitz Exp $
+# $Id: Memcached.pm 268 2006-04-30 05:29:36Z bradfitz $
 #
 # Copyright (c) 2003, 2004  Brad Fitzpatrick <brad@danga.com>
 #
@@ -32,7 +32,7 @@ use constant F_COMPRESS => 2;
 use constant COMPRESS_SAVINGS => 0.20; # percent
 
 use vars qw($VERSION $HAVE_ZLIB $FLAG_NOSIGNAL);
-$VERSION = "1.15";
+$VERSION = "1.16";
 
 BEGIN {
     $HAVE_ZLIB = eval "use Compress::Zlib (); 1;";
@@ -240,10 +240,10 @@ sub sock_to_host { # (host)
     unless ($connected) {
         socket($sock, PF_INET, SOCK_STREAM, $proto);
         $sin = Socket::sockaddr_in($port,Socket::inet_aton($ip));
-        unless (_connect_sock($sock,$sin,$self->{connect_timeout})) {
-            if (my $cb = $self->{cb_connect_fail}) {
-                $cb->($ip);
-            }
+        my $timeout = $self ? $self->{connect_timeout} : 0.25;
+        unless (_connect_sock($sock,$sin,$timeout)) {
+            my $cb = $self ? $self->{cb_connect_fail} : undef;
+            $cb->($ip) if $cb;
             return _dead_sock($sock, undef, 20 + int(rand(10)));
         }
     }
@@ -299,14 +299,21 @@ sub disconnect_all {
     %cache_sock = ();
 }
 
-sub _oneline {
+# writes a line, then reads result.  by default stops reading after a
+# single line, but caller can override the $check_complete subref,
+# which gets passed a scalarref of buffer read thus far.
+sub _write_and_read {
     my Cache::Memcached $self = shift;
-    my ($sock, $line) = @_;
+    my ($sock, $line, $check_complete) = @_;
     my $res;
     my ($ret, $offset) = (undef, 0);
 
+    $check_complete ||= sub {
+        return (rindex($ret, "\r\n") + 2 == length($ret));
+    };
+
     # state: 0 - writing, 1 - reading, 2 - done
-    my $state = defined $line ? 0 : 1;
+    my $state = 0;
 
     # the bitsets for select
     my ($rin, $rout, $win, $wout);
@@ -352,9 +359,7 @@ sub _oneline {
                 return undef;
             }
             $offset += $res;
-            if (rindex($ret, "\r\n") + 2 == length($ret)) {
-                $state = 2;
-            }
+            $state = 2 if $check_complete->(\$ret);
         }
     }
 
@@ -379,7 +384,7 @@ sub delete {
     $key = ref $key ? $key->[1] : $key;
     $time = $time ? " $time" : "";
     my $cmd = "delete $self->{namespace}$key$time\r\n";
-    my $res = _oneline($self, $sock, $cmd);
+    my $res = _write_and_read($self, $sock, $cmd);
 
     if ($self->{'stat_callback'}) {
         my $etime = Time::HiRes::time();
@@ -442,7 +447,7 @@ sub _set {
     local $SIG{'PIPE'} = "IGNORE" unless $FLAG_NOSIGNAL;
     my $line = "$cmdname $self->{namespace}$key $flags $exptime $len\r\n$val\r\n";
 
-    my $res = _oneline($self, $sock, $line);
+    my $res = _write_and_read($self, $sock, $line);
 
     if ($self->{'debug'} && $line) {
         chop $line; chop $line;
@@ -478,7 +483,7 @@ sub _incrdecr {
     $value = 1 unless defined $value;
 
     my $line = "$cmdname $self->{namespace}$key $value\r\n";
-    my $res = _oneline($self, $sock, $line);
+    my $res = _write_and_read($self, $sock, $line);
 
     if ($self->{'stat_callback'}) {
         my $etime = Time::HiRes::time();
@@ -635,6 +640,18 @@ sub _load_multi {
         }
         $offset{$sock} += $res;
 
+
+        # Below is a hot path.  In preparation for rewriting it in Perl/C,
+        # here are some notes.
+        #
+        # The while(1) below uses:
+        #   %buf
+        #   %reading
+        #   $active_changed
+        #   %key, %flags, %state, %offset
+        #   $finalize (CV)
+        #   $self->{namespace_len}
+
       SEARCH:
         while(1) { # may have to search many times
             # do we have a complete END line?
@@ -768,7 +785,7 @@ sub run_command {
     return () unless $sock;
     my $ret;
     my $line = $cmd;
-    while (my $res = _oneline($self, $sock, $line)) {
+    while (my $res = _write_and_read($self, $sock, $line)) {
         undef $line;
     $ret .= $res;
         last if $ret =~ /(?:END|ERROR)\r\n$/;
@@ -811,52 +828,39 @@ sub stats {
         my $sock = $self->sock_to_host($host);
       TYPE: foreach my $typename (grep !/^self$/, @$types) {
             my $type = $typename eq 'misc' ? "" : " $typename";
-            my $line = _oneline($self, $sock, "stats$type\r\n");
-            if (!$line) {
+            my $lines = _write_and_read($self, $sock, "stats$type\r\n", sub {
+                my $bref = shift;
+                return $$bref =~ /^(?:END|ERROR)\r?\n/m;
+            });
+            unless ($lines) {
                 _dead_sock($sock);
                 next HOST;
             }
+
+            $lines =~ s/\0//g;  # 'stats sizes' starts with NULL?
+
+            # And, most lines end in \r\n but 'stats maps' (as of
+            # July 2003 at least) ends in \n. ??
+            my @lines = split(/\r?\n/, $lines);
 
             # Some stats are key-value, some are not.  malloc,
             # sizes, and the empty string are key-value.
             # ("self" was handled separately above.)
             if ($typename =~ /^(malloc|sizes|misc)$/) {
                 # This stat is key-value.
-              LINE: while ($line) {
-                    # We have to munge this data a little.  First, I'm not
-                    # sure why, but 'stats sizes' output begins with NUL.
-                    $line =~ s/^\0//;
-
-                    # And, most lines end in \r\n but 'stats maps' (as of
-                    # July 2003 at least) ends in \n.  An alternative
-                    # would be { local $/="\r\n"; chomp } but this works
-                    # just as well:
-                    $line =~ s/[\r\n]+$//;
-
-                    # OK, process the data until the end, converting it
-                    # into its key-value pairs.
-                    last LINE if $line eq 'END';
+                foreach my $line (@lines) {
                     my($key, $value) = $line =~ /^(?:STAT )?(\w+)\s(.*)/;
                     if ($key) {
                         $stats_hr->{'hosts'}{$host}{$typename}{$key} = $value;
                     }
                     $malloc_keys{$key} = 1 if $typename eq 'malloc';
-
-                    # read the next line
-                    $line = _oneline($self, $sock);
                 }
             } else {
                 # This stat is not key-value so just pull it
                 # all out in one blob.
-              LINE: while ($line) {
-                    $line =~ s/[\r\n]+$//;
-                    last LINE if $line eq 'END';
-                    $stats_hr->{'hosts'}{$host}{$typename} ||= "";
-                    $stats_hr->{'hosts'}{$host}{$typename} .= "$line\n";
-
-                    # read the next one
-                    $line = _oneline($self, $sock);
-                }
+                $lines =~ s/^END\r?\n//m;
+                $stats_hr->{'hosts'}{$host}{$typename} ||= "";
+                $stats_hr->{'hosts'}{$host}{$typename} .= "$lines";
             }
         }
     }
@@ -896,7 +900,7 @@ sub stats_reset {
 
   HOST: foreach my $host (@{$self->{'buckets'}}) {
         my $sock = $self->sock_to_host($host);
-        my $ok = _oneline($self, $sock, "stats reset");
+        my $ok = _write_and_read($self, $sock, "stats reset");
         unless ($ok eq "RESET\r\n") {
             _dead_sock($sock);
         }
