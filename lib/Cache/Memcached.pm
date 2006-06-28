@@ -1,4 +1,4 @@
-# $Id: Memcached.pm 272 2006-04-30 09:00:50Z bradfitz $
+# $Id: Memcached.pm 294 2006-06-28 05:59:57Z bradfitz $
 #
 # Copyright (c) 2003, 2004  Brad Fitzpatrick <brad@danga.com>
 #
@@ -32,7 +32,7 @@ use constant F_COMPRESS => 2;
 use constant COMPRESS_SAVINGS => 0.20; # percent
 
 use vars qw($VERSION $HAVE_ZLIB $FLAG_NOSIGNAL);
-$VERSION = "1.17";
+$VERSION = "1.18";
 
 BEGIN {
     $HAVE_ZLIB = eval "use Compress::Zlib (); 1;";
@@ -107,7 +107,7 @@ sub set_connect_timeout {
 sub set_debug {
     my Cache::Memcached $self = shift;
     my ($dbg) = @_;
-    $self->{'debug'} = $dbg;
+    $self->{'debug'} = $dbg || 0;
 }
 
 sub set_readonly {
@@ -271,7 +271,7 @@ sub get_sock { # (key)
         my $host = $self->{'buckets'}->[$hv % $self->{'bucketcount'}];
         my $sock = $self->sock_to_host($host);
         return $sock if $sock;
-        return undef if $sock->{'no_rehash'};
+        return undef if $self->{'no_rehash'};
         $hv += _hashfunc($tries . $real_key);  # stupid, but works
     }
     return undef;
