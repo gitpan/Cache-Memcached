@@ -1,4 +1,4 @@
-# $Id: Memcached.pm 531 2007-05-02 22:06:57Z bradfitz $
+# $Id: Memcached.pm 564 2007-06-18 17:50:53Z bradfitz $
 #
 # Copyright (c) 2003, 2004  Brad Fitzpatrick <brad@danga.com>
 #
@@ -18,20 +18,13 @@ use Time::HiRes ();
 use String::CRC32;
 use Errno qw( EINPROGRESS EWOULDBLOCK EISCONN );
 use Cache::Memcached::GetParser;
-my $HAVE_XS = eval "use Cache::Memcached::GetParserXS; 1;";
-$HAVE_XS = 0 if $ENV{NO_XS};
-
-my $parser_class = $HAVE_XS ? "Cache::Memcached::GetParserXS" : "Cache::Memcached::GetParser";
-if ($ENV{XS_DEBUG}) {
-    print "using parser: $parser_class\n";
-}
-
 use fields qw{
     debug no_rehash stats compress_threshold compress_enable stat_callback
     readonly select_timeout namespace namespace_len servers active buckets
     pref_ip
     bucketcount _single_sock _stime
     connect_timeout cb_connect_fail
+    parser_class
 };
 
 # flag definitions
@@ -42,10 +35,18 @@ use constant F_COMPRESS => 2;
 use constant COMPRESS_SAVINGS => 0.20; # percent
 
 use vars qw($VERSION $HAVE_ZLIB $FLAG_NOSIGNAL);
-$VERSION = "1.21";
+$VERSION = "1.22";
 
 BEGIN {
     $HAVE_ZLIB = eval "use Compress::Zlib (); 1;";
+}
+
+my $HAVE_XS = eval "use Cache::Memcached::GetParserXS; 1;";
+$HAVE_XS = 0 if $ENV{NO_XS};
+
+my $parser_class = $HAVE_XS ? "Cache::Memcached::GetParserXS" : "Cache::Memcached::GetParser";
+if ($ENV{XS_DEBUG}) {
+    print "using parser: $parser_class\n";
 }
 
 $FLAG_NOSIGNAL = 0;
@@ -74,6 +75,7 @@ sub new {
     $self->{'compress_enable'}    = 1;
     $self->{'stat_callback'} = $args->{'stat_callback'} || undef;
     $self->{'readonly'} = $args->{'readonly'};
+    $self->{'parser_class'} = $args->{'parser_class'} || $parser_class;
 
     # TODO: undocumented
     $self->{'connect_timeout'} = $args->{'connect_timeout'} || 0.25;
@@ -158,16 +160,16 @@ sub set_stat_callback {
     $self->{'stat_callback'} = $stat_callback;
 }
 
-my %sock_map;  # scalaraddr -> "$ip:$port";
+my %sock_map;  # stringified-$sock -> "$ip:$port"
 
 sub _dead_sock {
     my ($sock, $ret, $dead_for) = @_;
-    if (my $ipport = $sock_map{\$sock}) {
+    if (my $ipport = $sock_map{$sock}) {
         my $now = time();
         $host_dead{$ipport} = $now + $dead_for
             if $dead_for;
         delete $cache_sock{$ipport};
-        delete $sock_map{\$sock};
+        delete $sock_map{$sock};
     }
     @buck2sock = ();
     return $ret;  # 0 or undef, probably, depending on what caller wants
@@ -175,10 +177,10 @@ sub _dead_sock {
 
 sub _close_sock {
     my ($sock) = @_;
-    if (my $ipport = $sock_map{\$sock}) {
+    if (my $ipport = $sock_map{$sock}) {
         close $sock;
         delete $cache_sock{$ipport};
-        delete $sock_map{\$sock};
+        delete $sock_map{$sock};
     }
     @buck2sock = ();
 }
@@ -546,7 +548,9 @@ sub get_multi {
 
     if ($self->{'_single_sock'}) {
         $sock = $self->sock_to_host($self->{'_single_sock'});
-        return {} unless $sock;
+        unless ($sock) {
+            return {};
+        }
         foreach my $key (@_) {
             my $kval = ref $key ? $key->[1] : $key;
             push @{$sock_keys{$sock}}, $kval;
@@ -664,7 +668,7 @@ sub _load_multi {
             $buf{$_} = join(" ", 'get', @{$sock_keys->{$_}}, "\r\n");
         }
 
-        $parser{$_} = $parser_class->new($ret, $self->{namespace_len}, $finalize);
+        $parser{$_} = $self->{parser_class}->new($ret, $self->{namespace_len}, $finalize);
     }
 
     my $read = sub {
@@ -900,8 +904,6 @@ sub stats_reset {
     }
     return 1;
 }
-
-
 
 1;
 __END__
