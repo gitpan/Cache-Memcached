@@ -1,4 +1,4 @@
-# $Id: Memcached.pm 564 2007-06-18 17:50:53Z bradfitz $
+# $Id: Memcached.pm 568 2007-06-19 20:49:19Z bradfitz $
 #
 # Copyright (c) 2003, 2004  Brad Fitzpatrick <brad@danga.com>
 #
@@ -35,7 +35,7 @@ use constant F_COMPRESS => 2;
 use constant COMPRESS_SAVINGS => 0.20; # percent
 
 use vars qw($VERSION $HAVE_ZLIB $FLAG_NOSIGNAL);
-$VERSION = "1.22";
+$VERSION = "1.23";
 
 BEGIN {
     $HAVE_ZLIB = eval "use Compress::Zlib (); 1;";
@@ -402,7 +402,6 @@ sub _write_and_read {
     return $ret;
 }
 
-
 sub delete {
     my Cache::Memcached $self = shift;
     my ($key, $time) = @_;
@@ -424,6 +423,7 @@ sub delete {
 
     return $res eq "DELETED\r\n";
 }
+*remove = \&delete;
 
 sub add {
     _set("add", @_);
@@ -1072,6 +1072,9 @@ Deletes a key.  You may optionally provide an integer time value (in seconds) to
 tell the memcached server to block new writes to this key for that many seconds.
 (Sometimes useful as a hacky means to prevent races.)  Returns true if key
 was found and deleted, and false otherwise.
+
+You may also use the alternate method name B<remove>, so
+Cache::Memcached looks like the L<Cache::Cache> API.
 
 =item C<incr>
 
