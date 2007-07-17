@@ -1,3 +1,14 @@
+2007-07-17: version 1.24
+
+	* update the stats method, including tests for it
+	  (Ronald J Kimball <rkimball+memcached@pangeamedia.com>)
+
+	* arguments to 'new' constructor can be %hash or $hashref now
+	  (previously was only $hashref)
+
+	* work around a Perl segfault (Matthieu PATOU <mp@oxado.com>)
+	  see http://lists.danga.com/pipermail/memcached/2007-June/004511.html
+
 2007-06-19: version 1.23
 
 	* add 'remove' as an alias for 'delete' (Dave Cardwell <dave@davecardwell.co.uk>)
