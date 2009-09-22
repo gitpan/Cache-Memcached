@@ -1,6 +1,6 @@
 --- #YAML:1.0
 name:                Cache-Memcached
-version:             1.26
+version:             1.27
 abstract:            client library for memcached (memory cache daemon)
 license:             ~
 author:              

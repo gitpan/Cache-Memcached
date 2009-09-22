@@ -1,4 +1,4 @@
-# $Id: Memcached.pm 811 2009-05-05 01:32:37Z bradfitz $
+# $Id: Memcached.pm 827 2009-09-22 05:29:08Z bradfitz $
 #
 # Copyright (c) 2003, 2004  Brad Fitzpatrick <brad@danga.com>
 #
@@ -18,6 +18,7 @@ use Time::HiRes ();
 use String::CRC32;
 use Errno qw( EINPROGRESS EWOULDBLOCK EISCONN );
 use Cache::Memcached::GetParser;
+use Encode ();
 use fields qw{
     debug no_rehash stats compress_threshold compress_enable stat_callback
     readonly select_timeout namespace namespace_len servers active buckets
@@ -35,7 +36,7 @@ use constant F_COMPRESS => 2;
 use constant COMPRESS_SAVINGS => 0.20; # percent
 
 use vars qw($VERSION $HAVE_ZLIB $FLAG_NOSIGNAL);
-$VERSION = "1.26";
+$VERSION = "1.27";
 
 BEGIN {
     $HAVE_ZLIB = eval "use Compress::Zlib (); 1;";
@@ -440,6 +441,14 @@ sub set {
     _set("set", @_);
 }
 
+sub append {
+    _set("append", @_);
+}
+
+sub prepend {
+    _set("prepend", @_);
+}
+
 sub _set {
     my $cmdname = shift;
     my Cache::Memcached $self = shift;
@@ -451,11 +460,13 @@ sub _set {
 
     use bytes; # return bytes from length()
 
+    my $app_or_prep = $cmdname eq 'append' || $cmdname eq 'prepend' ? 1 : 0;
     $self->{'stats'}->{$cmdname}++;
     my $flags = 0;
     $key = ref $key ? $key->[1] : $key;
 
     if (ref $val) {
+        die "append or prepend cannot take a reference" if $app_or_prep;
         local $Carp::CarpLevel = 2;
         $val = Storable::nfreeze($val);
         $flags |= F_STORABLE;
@@ -465,7 +476,7 @@ sub _set {
     my $len = length($val);
 
     if ($self->{'compress_threshold'} && $HAVE_ZLIB && $self->{'compress_enable'} &&
-        $len >= $self->{'compress_threshold'}) {
+        $len >= $self->{'compress_threshold'} && !$app_or_prep) {
 
         my $c_val = Compress::Zlib::memGzip($val);
         my $c_len = length($c_val);
@@ -537,6 +548,11 @@ sub get {
     # TODO: make a fast path for this?  or just keep using get_multi?
     my $r = $self->get_multi($key);
     my $kval = ref $key ? $key->[1] : $key;
+
+    # key reconstituted from server won't have utf8 on, so turn it off on input
+    # scalar to allow hash lookup to succeed
+    Encode::_utf8_off($kval) if Encode::is_utf8($kval);
+
     return $r->{$kval};
 }
 
