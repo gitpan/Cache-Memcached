@@ -1,3 +1,9 @@
+2009-10-21: version 1.28
+
+	* IPv6 support (https://rt.cpan.org/Ticket/Display.html?id=50577)
+
+	* Add Encode.pm requirement to Makefile.PL for perl 5.6.x (Ask).
+
 2009-09-22: version 1.27
 
 	* Fix get() with utf-8 keys  (athomason)

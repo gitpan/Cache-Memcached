@@ -1,6 +1,6 @@
 --- #YAML:1.0
 name:                Cache-Memcached
-version:             1.27
+version:             1.28
 abstract:            client library for memcached (memory cache daemon)
 license:             ~
 author:              
@@ -8,6 +8,7 @@ author:
 generated_by:        ExtUtils::MakeMaker version 6.42
 distribution_type:   module
 requires:     
+    Encode:                        0
     Storable:                      0
     String::CRC32:                 0
     Time::HiRes:                   0
