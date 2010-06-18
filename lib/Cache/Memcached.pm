@@ -1,4 +1,4 @@
-# $Id: Memcached.pm 833 2009-10-21 21:51:10Z bradfitz $
+# $Id: Memcached.pm 844 2010-06-18 01:26:15Z dormando $
 #
 # Copyright (c) 2003, 2004  Brad Fitzpatrick <brad@danga.com>
 #
@@ -26,6 +26,7 @@ use fields qw{
     bucketcount _single_sock _stime
     connect_timeout cb_connect_fail
     parser_class
+    buck2sock
 };
 
 # flag definitions
@@ -36,7 +37,7 @@ use constant F_COMPRESS => 2;
 use constant COMPRESS_SAVINGS => 0.20; # percent
 
 use vars qw($VERSION $HAVE_ZLIB $FLAG_NOSIGNAL $HAVE_SOCKET6);
-$VERSION = "1.28";
+$VERSION = "1.29";
 
 BEGIN {
     $HAVE_ZLIB = eval "use Compress::Zlib (); 1;";
@@ -56,7 +57,6 @@ eval { $FLAG_NOSIGNAL = MSG_NOSIGNAL; };
 
 my %host_dead;   # host -> unixtime marked dead until
 my %cache_sock;  # host -> socket
-my @buck2sock;   # bucket number -> $sock
 
 my $PROTO_TCP;
 
@@ -68,6 +68,7 @@ sub new {
 
     my $args = (@_ == 1) ? shift : { @_ };  # hashref-ify args
 
+    $self->{'buck2sock'}= [];
     $self->set_servers($args->{'servers'});
     $self->{'debug'} = $args->{'debug'} || 0;
     $self->{'no_rehash'} = $args->{'no_rehash'};
@@ -101,7 +102,7 @@ sub set_servers {
     $self->{'buckets'} = undef;
     $self->{'bucketcount'} = 0;
     $self->init_buckets;
-    @buck2sock = ();
+    $self->{'buck2sock'}= [];
 
     $self->{'_single_sock'} = undef;
     if (@{$self->{'servers'}} == 1) {
@@ -152,8 +153,9 @@ sub enable_compress {
 }
 
 sub forget_dead_hosts {
+    my Cache::Memcached $self = shift;
     %host_dead = ();
-    @buck2sock = ();
+    $self->{'buck2sock'} = [];
 }
 
 sub set_stat_callback {
@@ -165,7 +167,7 @@ sub set_stat_callback {
 my %sock_map;  # stringified-$sock -> "$ip:$port"
 
 sub _dead_sock {
-    my ($sock, $ret, $dead_for) = @_;
+    my ($self, $sock, $ret, $dead_for) = @_;
     if (my $ipport = $sock_map{$sock}) {
         my $now = time();
         $host_dead{$ipport} = $now + $dead_for
@@ -173,18 +175,18 @@ sub _dead_sock {
         delete $cache_sock{$ipport};
         delete $sock_map{$sock};
     }
-    @buck2sock = ();
+    $self->{'buck2sock'} = [] if $self;
     return $ret;  # 0 or undef, probably, depending on what caller wants
 }
 
 sub _close_sock {
-    my ($sock) = @_;
+    my ($self, $sock) = @_;
     if (my $ipport = $sock_map{$sock}) {
         close $sock;
         delete $cache_sock{$ipport};
         delete $sock_map{$sock};
     }
-    @buck2sock = ();
+    $self->{'buck2sock'} = [];
 }
 
 sub _connect_sock { # sock, sin, timeout
@@ -226,14 +228,16 @@ sub _connect_sock { # sock, sin, timeout
     return $ret;
 }
 
-sub sock_to_host { # (host)
+sub sock_to_host { # (host)  #why is this public? I wouldn't have to worry about undef $self if it weren't.
     my Cache::Memcached $self = ref $_[0] ? shift : undef;
     my $host = $_[0];
     return $cache_sock{$host} if $cache_sock{$host};
 
     my $now = time();
     my ($ip, $port) = $host =~ /(.*):(\d+)$/;
-    $ip =~ s/[\[\]]//g; # get rid of optional IPv6 brackets
+    if (defined($ip)) {
+        $ip =~ s/[\[\]]//g;  # get rid of optional IPv6 brackets
+    }
 
     return undef if
         $host_dead{$host} && $host_dead{$host} > $now;
@@ -288,7 +292,7 @@ sub sock_to_host { # (host)
             unless (_connect_sock($sock, $sin, $timeout)) {
                 my $cb = $self ? $self->{cb_connect_fail} : undef;
                 $cb->($ip) if $cb;
-                return _dead_sock($sock, undef, 20 + int(rand(10)));
+                return _dead_sock($self, $sock, undef, 20 + int(rand(10)));
             }
         }
     } else { # it's a unix domain/local socket
@@ -299,7 +303,7 @@ sub sock_to_host { # (host)
         unless (_connect_sock($sock,$sin,$timeout)) {
             my $cb = $self ? $self->{cb_connect_fail} : undef;
             $cb->($host) if $cb;
-            return _dead_sock($sock, undef, 20 + int(rand(10)));
+            return _dead_sock($self, $sock, undef, 20 + int(rand(10)));
         }
     }
 
@@ -347,12 +351,13 @@ sub init_buckets {
 }
 
 sub disconnect_all {
+    my Cache::Memcached $self = shift;
     my $sock;
     foreach $sock (values %cache_sock) {
         close $sock;
     }
     %cache_sock = ();
-    @buck2sock = ();
+    $self->{'buck2sock'} = [];
 }
 
 # writes a line, then reads result.  by default stops reading after a
@@ -396,7 +401,7 @@ sub _write_and_read {
             next
                 if not defined $res and $!==EWOULDBLOCK;
             unless ($res > 0) {
-                _close_sock($sock);
+                $self->_close_sock($sock);
                 return undef;
             }
             if ($res == length($line)) { # all sent
@@ -411,7 +416,7 @@ sub _write_and_read {
             next
                 if !defined($res) and $!==EWOULDBLOCK;
             if ($res == 0) { # catches 0=conn closed or undef=error
-                _close_sock($sock);
+                $self->_close_sock($sock);
                 return undef;
             }
             $offset += $res;
@@ -420,7 +425,7 @@ sub _write_and_read {
     }
 
     unless ($state == 2) {
-        _dead_sock($sock); # improperly finished
+        $self->_dead_sock($sock); # improperly finished
         return undef;
     }
 
@@ -614,9 +619,9 @@ sub get_multi {
                 #    and last;
 
                 # but this variant doesn't crash:
-                $sock = $buck2sock[$bucket] || $self->sock_to_host($self->{buckets}[ $bucket ]);
+                $sock = $self->{'buck2sock'}->[$bucket] || $self->sock_to_host($self->{buckets}[ $bucket ]);
                 if ($sock) {
-                    $buck2sock[$bucket] = $sock;
+                    $self->{'buck2sock'}->[$bucket] = $sock;
                     last;
                 }
 
@@ -676,7 +681,7 @@ sub _load_multi {
         }
 
         close $sock;
-        _dead_sock($sock);
+        $self->_dead_sock($sock);
     };
 
     # $finalize->($key, $flags)
@@ -884,6 +889,7 @@ sub stats {
     my @hosts = @{$self->{'buckets'}};
   HOST: foreach my $host (@hosts) {
         my $sock = $self->sock_to_host($host);
+        next HOST unless $sock;
       TYPE: foreach my $typename (grep !/^self$/, @$types) {
             my $type = $typename eq 'misc' ? "" : " $typename";
             my $lines = _write_and_read($self, $sock, "stats$type\r\n", sub {
@@ -891,7 +897,7 @@ sub stats {
                 return $$bref =~ /^(?:END|ERROR)\r?\n/m;
             });
             unless ($lines) {
-                _dead_sock($sock);
+                $self->_dead_sock($sock);
                 next HOST;
             }
 
@@ -936,9 +942,10 @@ sub stats_reset {
 
   HOST: foreach my $host (@{$self->{'buckets'}}) {
         my $sock = $self->sock_to_host($host);
+        next HOST unless $sock;
         my $ok = _write_and_read($self, $sock, "stats reset");
         unless (defined $ok && $ok eq "RESET\r\n") {
-            _dead_sock($sock);
+            $self->_dead_sock($sock);
         }
     }
     return 1;
