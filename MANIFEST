@@ -13,4 +13,6 @@ t/04_noreply.t
 t/05_reconnect_timeout.t
 t/06_utf8_key.t
 t/100_flush_bug.t
-META.yml                                 Module meta-data (added by MakeMaker)
+t/101_multiple_clients.t
+META.yml                                 Module YAML meta-data (added by MakeMaker)
+META.json                                Module JSON meta-data (added by MakeMaker)

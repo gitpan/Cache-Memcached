@@ -1,8 +1,23 @@
+2012-05-19: version 1.30
+
+	* Fix buck2sock corruption that causes errors like
+	  "No map found matching for GLOB" or "No sock found for" (hachi@cpan.org)
+	    https://rt.cpan.org/Ticket/Display.html?id=62872
+
+	* Fix t/05_reconnect_timeout.t to not fail on networks that fast-reject
+	  TEST-NET-1 https://rt.cpan.org/Ticket/Display.html?id=74500
+
+	* Fix warning about undefined value in GetParser.pm (kost@ropnet.ru)
+	    https://rt.cpan.org/Ticket/Display.html?id=31067
+
+	* Add documentation of connect_timeout and select_timeout
+	    https://rt.cpan.org/Ticket/Display.html?id=30904
+
 2010-06-17: version 1.29
 
-    * fix warnings spew if calling stats on a down server
+	* fix warnings spew if calling stats on a down server
 
-    * fix buck2sock confusion (Eddie Canales)
+	* fix buck2sock confusion (Eddie Canales)
 
 	* quell ipv6-related warning
 	  https://rt.cpan.org/Ticket/Display.html?id=51761

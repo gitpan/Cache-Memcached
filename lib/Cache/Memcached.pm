@@ -1,4 +1,4 @@
-# $Id: Memcached.pm 844 2010-06-18 01:26:15Z dormando $
+# $Id$
 #
 # Copyright (c) 2003, 2004  Brad Fitzpatrick <brad@danga.com>
 #
@@ -26,7 +26,7 @@ use fields qw{
     bucketcount _single_sock _stime
     connect_timeout cb_connect_fail
     parser_class
-    buck2sock
+    buck2sock buck2sock_generation
 };
 
 # flag definitions
@@ -37,7 +37,7 @@ use constant F_COMPRESS => 2;
 use constant COMPRESS_SAVINGS => 0.20; # percent
 
 use vars qw($VERSION $HAVE_ZLIB $FLAG_NOSIGNAL $HAVE_SOCKET6);
-$VERSION = "1.29";
+$VERSION = "1.30";
 
 BEGIN {
     $HAVE_ZLIB = eval "use Compress::Zlib (); 1;";
@@ -57,6 +57,7 @@ eval { $FLAG_NOSIGNAL = MSG_NOSIGNAL; };
 
 my %host_dead;   # host -> unixtime marked dead until
 my %cache_sock;  # host -> socket
+my $socket_cache_generation = 1; # Set to 1 here because below the buck2sock_generation is set to 0, keep them in order.
 
 my $PROTO_TCP;
 
@@ -69,6 +70,7 @@ sub new {
     my $args = (@_ == 1) ? shift : { @_ };  # hashref-ify args
 
     $self->{'buck2sock'}= [];
+    $self->{'buck2sock_generation'} = 0;
     $self->set_servers($args->{'servers'});
     $self->{'debug'} = $args->{'debug'} || 0;
     $self->{'no_rehash'} = $args->{'no_rehash'};
@@ -102,7 +104,9 @@ sub set_servers {
     $self->{'buckets'} = undef;
     $self->{'bucketcount'} = 0;
     $self->init_buckets;
-    $self->{'buck2sock'}= [];
+
+    # We didn't close any sockets, so we reset the buck2sock generation, not increment the global socket cache generation.
+    $self->{'buck2sock_generation'} = 0;
 
     $self->{'_single_sock'} = undef;
     if (@{$self->{'servers'}} == 1) {
@@ -155,7 +159,11 @@ sub enable_compress {
 sub forget_dead_hosts {
     my Cache::Memcached $self = shift;
     %host_dead = ();
-    $self->{'buck2sock'} = [];
+
+    # We need to globally recalculate our buck2sock in all objects, so we increment the global generation.
+    $socket_cache_generation++;
+
+    return 1;
 }
 
 sub set_stat_callback {
@@ -175,7 +183,9 @@ sub _dead_sock {
         delete $cache_sock{$ipport};
         delete $sock_map{$sock};
     }
-    $self->{'buck2sock'} = [] if $self;
+    # We need to globally recalculate our buck2sock in all objects, so we increment the global generation.
+    $socket_cache_generation++;
+
     return $ret;  # 0 or undef, probably, depending on what caller wants
 }
 
@@ -186,7 +196,11 @@ sub _close_sock {
         delete $cache_sock{$ipport};
         delete $sock_map{$sock};
     }
-    $self->{'buck2sock'} = [];
+
+    # We need to globally recalculate our buck2sock in all objects, so we increment the global generation.
+    $socket_cache_generation++;
+
+    return 1;
 }
 
 sub _connect_sock { # sock, sin, timeout
@@ -357,7 +371,9 @@ sub disconnect_all {
         close $sock;
     }
     %cache_sock = ();
-    $self->{'buck2sock'} = [];
+
+    # We need to globally recalculate our buck2sock in all objects, so we increment the global generation.
+    $socket_cache_generation++;
 }
 
 # writes a line, then reads result.  by default stops reading after a
@@ -604,6 +620,12 @@ sub get_multi {
     } else {
         my $bcount = $self->{'bucketcount'};
         my $sock;
+
+        if ($self->{'buck2sock_generation'} != $socket_cache_generation) {
+            $self->{'buck2sock_generation'} = $socket_cache_generation;
+            $self->{'buck2sock'} = [];
+        }
+
       KEY:
         foreach my $key (@_) {
             my ($hv, $real_key) = ref $key ?
@@ -1021,6 +1043,10 @@ Use C<namespace> to prefix all keys with the provided namespace value.
 That is, if you set namespace to "app1:" and later do a set of "foo"
 to "bar", memcached is actually seeing you set "app1:foo" to "bar".
 
+Use C<connect_timeout> and C<select_timeout> to set connection and
+polling timeouts. The C<connect_timeout> defaults to .25 second, and
+the C<select_timeout> defaults to 1 second.
+
 The other useful key is C<debug>, which when set to true will produce
 diagnostics on STDERR.
 
@@ -1051,6 +1077,14 @@ Sets the C<no_rehash> flag.  See C<new> constructor for more information.
 =item C<set_compress_threshold>
 
 Sets the compression threshold. See C<new> constructor for more information.
+
+=item C<set_connect_timeout>
+
+Sets the connect timeout. See C<new> constructor for more information.
+
+=item C<set_select_timeout>
+
+Sets the select timeout. See C<new> constructor for more information.
 
 =item C<enable_compress>
 
